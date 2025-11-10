@@ -4,7 +4,9 @@ import math
 import os
 import pickle
 import subprocess
-from typing import List, Tuple, Any
+from typing import List, Tuple, Any, Optional, Sequence
+import h5py
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -14,8 +16,24 @@ import torchvision.transforms as transforms
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoTokenizer
 
-from dataset import TabularDataset, TextDataset, load_agnews
+from dataset import TabularDataset, TextDataset, load_agnews, TabularDatasetTabPFN
 from trainers.fast_train import get_batches, load_cifar10_data
+
+import h5py
+import numpy as np
+
+def save_sampled(src_path, dst_path, indices):
+    indices = np.asarray(indices)
+
+    with h5py.File(src_path, "r") as fin, h5py.File(dst_path, "w") as fout:
+        for key in fin.keys():
+            data = fin[key]
+            if data.shape and data.shape[0] == fin["X"].shape[0]:
+                fout.create_dataset(key, data=data[indices])
+            else:
+                fout.create_dataset(key, data=data[()])
+
+        fout.create_dataset("sampled_indices", data=indices)
 
 
 class InfinitelyIndexableDataset(Dataset):
@@ -140,6 +158,61 @@ def get_dataset(dataset_name: str, data_dir: str, logger: Any, **kwargs: Any) ->
             with open(f"{path}_population.pkl", "wb") as file:
                 pickle.dump(test_data, file)
             logger.info(f"Save population data to {path}_population.pkl")
+
+        elif dataset_name == "300k_150x5_2":
+            if not os.path.exists(f"{data_dir}/300k_150x5_2.h5"):
+                logger.info(
+                    f"{dataset_name} not found in /{data_dir}. Downloading data from https://github.com/automl/nanoTabPFN to /{data_dir}..."
+                )
+                try:
+                    # Download the dataset to /data
+                    subprocess.run(
+                        [
+                            "wget",
+                            "http://ml.informatik.uni-freiburg.de/research-artifacts/nanoTabPFN/300k_150x5_2.h5",
+                            "-P",
+                            f"./{data_dir}",
+                        ],
+                        check=True,
+                    )
+                    logger.info(
+                        "Dataset downloaded and extracted to /data successfully."
+                    )
+                except subprocess.CalledProcessError as e:
+                    logger.error(f"Error during download or extraction: {e}")
+                    raise RuntimeError("Failed to download or extract the dataset.")
+            with h5py.File(f"{data_dir}/300k_150x5_2.h5", "r") as f:
+                X_all = f["X"]
+                y_all = f["y"]
+                single_eval_pos_all = f["single_eval_pos"]
+                num_of_datasets = X_all.shape[0]
+                training_size = int(
+                    len(y_all) * 0.75
+                ) 
+                idxs = sorted(np.random.choice(num_of_datasets, size=training_size, replace=False))
+                idxs_test = sorted(np.setdiff1d(np.arange(num_of_datasets), idxs))
+                all_data = []
+                for i in idxs:
+                    X_i = np.array(X_all[i], dtype=np.float32)
+                    y_i = np.array(y_all[i])
+                    y_i = y_i.astype(np.int64, copy=False)
+                    single_eval_pos_i = np.array(single_eval_pos_all[i], dtype=np.int8)
+                    all_data.append(TabularDatasetTabPFN(X_i, y_i, single_eval_pos_i))
+                test_data = []
+                for i in idxs_test:
+                    X_i = np.array(X_all[i], dtype=np.float32)
+                    y_i = np.array(y_all[i])
+                    y_i = y_i.astype(np.int64, copy=False)
+                    single_eval_pos_i = np.array(single_eval_pos_all[i], dtype=np.int8)
+                    test_data.append(TabularDatasetTabPFN(X_i, y_i, single_eval_pos_i))
+
+            # TODO for Tuesday 11.11: make it faster
+                
+            save_sampled(f"{data_dir}/300k_150x5_2.h5" , f"{data_dir}/300k_150x5_2_axis0_all.h5", idxs)
+            logger.info("Save data to 300k_150x5_2_axis0_all.h5")
+            save_sampled(f"{data_dir}/300k_150x5_2.h5" , f"{data_dir}/300k_150x5_2_axis0_test.h5", idxs_test)
+            logger.info("Save population data to 300k_150x5_2_axis0_test.h5")
+
         elif dataset_name == "purchase100":
             if not os.path.exists(f"{data_dir}/dataset_purchase"):
                 logger.info(
