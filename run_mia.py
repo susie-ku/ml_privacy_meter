@@ -72,8 +72,6 @@ def main():
     dataset, population = load_dataset(configs, directories["data_dir"], logger)
     logger.info("Loading dataset took %0.5f seconds", time.time() - baseline_time)
 
-    1/0
-
     # Define experiment parameters
     num_experiments = configs["run"]["num_experiments"]
     num_reference_models = configs["audit"]["num_ref_models"]

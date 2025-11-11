@@ -19,21 +19,238 @@ from transformers import AutoTokenizer
 from dataset import TabularDataset, TextDataset, load_agnews, TabularDatasetTabPFN
 from trainers.fast_train import get_batches, load_cifar10_data
 
-import h5py
-import numpy as np
+
+META_KEYS = ("chunks", "compression", "compression_opts", "shuffle", "fletcher32")
+
+
+def _copy_sampling_metadata(src_dataset):
+    """Copy dataset creation kwargs (compression/chunks) to preserve layout."""
+    kwargs = {}
+    for key in META_KEYS:
+        value = getattr(src_dataset, key, None)
+        if value is not None:
+            kwargs[key] = value
+    return kwargs
+
+
+def _sanitize_chunks(chunks, target_shape):
+    if not chunks:
+        return None
+    sanitized = []
+    for dim_len, chunk_len in zip(target_shape, chunks):
+        if dim_len == 0:
+            return None
+        sanitized.append(max(1, min(int(dim_len), int(chunk_len))))
+    return tuple(sanitized)
+
+
+def _write_rows(dst_dataset, dest_slice, rows_slice):
+    if len(dest_slice) == 0:
+        return
+    dest_slice = np.asarray(dest_slice, dtype=np.int64)
+    if len(dest_slice) == 1:
+        dst_dataset[int(dest_slice[0])] = rows_slice[0]
+        return
+    if np.all(dest_slice[1:] == dest_slice[:-1] + 1):
+        start = int(dest_slice[0])
+        end = int(dest_slice[-1]) + 1
+        dst_dataset[start:end] = rows_slice
+        return
+    scatter_order = np.argsort(dest_slice, kind="mergesort")
+    dest_sorted = dest_slice[scatter_order]
+    rows_sorted = rows_slice[scatter_order]
+    dst_dataset[dest_sorted] = rows_sorted
+
+
+def _stream_copy_rows(src_dataset, dst_dataset, sorted_indices, dest_order):
+    if len(sorted_indices) == 0:
+        return
+
+    num_rows = src_dataset.shape[0]
+    chunk_hint = getattr(src_dataset, "chunks", None)
+    if chunk_hint and len(chunk_hint) > 0 and chunk_hint[0]:
+        chunk_len = int(chunk_hint[0])
+    else:
+        chunk_len = max(1, min(1 << 15, num_rows))
+    chunk_len = max(1, min(chunk_len, num_rows))
+    max_span = max(chunk_len, min(num_rows, chunk_len * 8))
+
+    ptr = 0
+    total = len(sorted_indices)
+    while ptr < total:
+        idx = int(sorted_indices[ptr])
+        chunk_start = (idx // chunk_len) * chunk_len
+        chunk_end = min(chunk_start + chunk_len, num_rows)
+
+        chunk_stop = ptr
+        while True:
+            while chunk_stop < total and sorted_indices[chunk_stop] < chunk_end:
+                chunk_stop += 1
+
+            if chunk_stop == total:
+                break
+
+            span = sorted_indices[chunk_stop] - chunk_start
+            if span < max_span and chunk_end < num_rows:
+                chunk_end = min(chunk_end + chunk_len, num_rows)
+                continue
+            break
+
+        data_chunk = src_dataset[chunk_start:chunk_end]
+        relative_indices = sorted_indices[ptr:chunk_stop] - chunk_start
+        sampled_rows = data_chunk[relative_indices]
+        dest_slice = dest_order[ptr:chunk_stop]
+        _write_rows(dst_dataset, dest_slice, sampled_rows)
+
+        ptr = chunk_stop
+
 
 def save_sampled(src_path, dst_path, indices):
     indices = np.asarray(indices)
+    if indices.ndim != 1:
+        raise ValueError("indices must be a 1-D sequence")
+    if not np.issubdtype(indices.dtype, np.integer):
+        raise TypeError("indices must be integers")
+    indices = indices.astype(np.int64, copy=False)
+
+    sort_order = np.argsort(indices, kind="mergesort")
+    sorted_indices = indices[sort_order]
 
     with h5py.File(src_path, "r") as fin, h5py.File(dst_path, "w") as fout:
-        for key in fin.keys():
-            data = fin[key]
-            if data.shape and data.shape[0] == fin["X"].shape[0]:
-                fout.create_dataset(key, data=data[indices])
+        if "X" not in fin:
+            raise KeyError("Source file must contain dataset 'X' to infer sample size")
+        num_rows = fin["X"].shape[0]
+
+        if np.any(indices < 0) or np.any(indices >= num_rows):
+            raise IndexError("indices contain values outside the dataset range")
+
+        for key, data in fin.items():
+            if data.shape and data.shape[0] == num_rows:
+                target_shape = (len(indices),) + data.shape[1:]
+                creation_kwargs = _copy_sampling_metadata(data)
+                chunks = creation_kwargs.get("chunks")
+                if chunks:
+                    sanitized = _sanitize_chunks(chunks, target_shape)
+                    if sanitized:
+                        creation_kwargs["chunks"] = sanitized
+                    else:
+                        creation_kwargs.pop("chunks", None)
+                if target_shape[0] == 0:
+                    creation_kwargs.pop("chunks", None)
+                dst_dataset = fout.create_dataset(
+                    key,
+                    shape=target_shape,
+                    dtype=data.dtype,
+                    **creation_kwargs,
+                )
+                _stream_copy_rows(data, dst_dataset, sorted_indices, sort_order)
             else:
                 fout.create_dataset(key, data=data[()])
 
         fout.create_dataset("sampled_indices", data=indices)
+
+
+def verify_sampled_files(src_path, sampled_paths, batch_size=1024):
+    """
+    Ensure that sampled HDF5 files store data identical to the source rows referenced
+    by their respective 'sampled_indices' datasets.
+    """
+    if isinstance(sampled_paths, (str, bytes, os.PathLike)):
+        sampled_paths = [sampled_paths]
+
+    with h5py.File(src_path, "r") as src_file:
+        if "X" not in src_file:
+            raise KeyError("Source file must contain dataset 'X' to infer row count.")
+        num_rows = src_file["X"].shape[0]
+
+        for sampled_path in sampled_paths:
+            with h5py.File(sampled_path, "r") as sampled_file:
+                if "sampled_indices" not in sampled_file:
+                    raise KeyError(
+                        f"'sampled_indices' missing from sampled file {sampled_path}"
+                    )
+                indices = np.asarray(
+                    sampled_file["sampled_indices"][()], dtype=np.int64
+                )
+                if indices.ndim != 1:
+                    raise ValueError(
+                        f"'sampled_indices' must be 1-D in sampled file {sampled_path}"
+                    )
+                if np.any(indices < 0) or np.any(indices >= num_rows):
+                    raise ValueError(
+                        f"Indices in {sampled_path} fall outside the source dataset."
+                    )
+
+                effective_batch = max(1, min(int(batch_size), len(indices)))
+
+                for key, sampled_dataset in sampled_file.items():
+                    if key == "sampled_indices":
+                        continue
+                    if key not in src_file:
+                        raise KeyError(
+                            f"Key '{key}' exists in {sampled_path} but not in source file."
+                        )
+                    src_dataset = src_file[key]
+                    if (
+                        src_dataset.shape
+                        and src_dataset.shape[0] == num_rows
+                        and sampled_dataset.shape
+                        and sampled_dataset.shape[0] == len(indices)
+                    ):
+                        _assert_axis_samples_match(
+                            src_dataset,
+                            sampled_dataset,
+                            indices,
+                            effective_batch,
+                            key,
+                            sampled_path,
+                        )
+                    else:
+                        src_value = src_dataset[()]
+                        sampled_value = sampled_dataset[()]
+                        if not _arrays_equal(src_value, sampled_value):
+                            raise AssertionError(
+                                f"Dataset '{key}' mismatch between source and {sampled_path}"
+                            )
+
+
+def _arrays_equal(lhs, rhs):
+    lhs_arr = np.asarray(lhs)
+    rhs_arr = np.asarray(rhs)
+    if lhs_arr.dtype.kind in ("f", "c") or rhs_arr.dtype.kind in ("f", "c"):
+        return np.array_equal(lhs_arr, rhs_arr, equal_nan=True)
+    try:
+        return np.array_equal(lhs_arr, rhs_arr)
+    except TypeError:
+        return lhs == rhs
+
+
+def _assert_axis_samples_match(
+    src_dataset, sampled_dataset, indices, batch_size, key, sampled_path
+):
+    total = len(indices)
+    for start in range(0, total, batch_size):
+        end = min(total, start + batch_size)
+        batch_indices = indices[start:end]
+        src_slice = _fetch_rows(src_dataset, batch_indices)
+        sampled_slice = sampled_dataset[start:end]
+        if not _arrays_equal(src_slice, sampled_slice):
+            raise AssertionError(
+                f"Dataset '{key}' mismatch in rows {start}:{end} for {sampled_path}"
+            )
+
+
+def _fetch_rows(dataset, index_batch):
+    if len(index_batch) == 0:
+        return dataset[0:0]
+    index_batch = np.asarray(index_batch, dtype=np.int64)
+    if np.all(index_batch[1:] >= index_batch[:-1]):
+        return dataset[index_batch]
+    sorted_order = np.argsort(index_batch, kind="mergesort")
+    sorted_rows = dataset[index_batch[sorted_order]]
+    inverse_order = np.empty_like(sorted_order)
+    inverse_order[sorted_order] = np.arange(len(sorted_order))
+    return sorted_rows[inverse_order]
 
 
 class InfinitelyIndexableDataset(Dataset):
@@ -205,13 +422,26 @@ def get_dataset(dataset_name: str, data_dir: str, logger: Any, **kwargs: Any) ->
                     y_i = y_i.astype(np.int64, copy=False)
                     single_eval_pos_i = np.array(single_eval_pos_all[i], dtype=np.int8)
                     test_data.append(TabularDatasetTabPFN(X_i, y_i, single_eval_pos_i))
-
-            # TODO for Tuesday 11.11: make it faster
-                
-            save_sampled(f"{data_dir}/300k_150x5_2.h5" , f"{data_dir}/300k_150x5_2_axis0_all.h5", idxs)
+            save_sampled(
+                f"{data_dir}/300k_150x5_2.h5",
+                f"{data_dir}/300k_150x5_2_axis0_all.h5",
+                idxs,
+            )
             logger.info("Save data to 300k_150x5_2_axis0_all.h5")
-            save_sampled(f"{data_dir}/300k_150x5_2.h5" , f"{data_dir}/300k_150x5_2_axis0_test.h5", idxs_test)
+            save_sampled(
+                f"{data_dir}/300k_150x5_2.h5",
+                f"{data_dir}/300k_150x5_2_axis0_test.h5",
+                idxs_test,
+            )
             logger.info("Save population data to 300k_150x5_2_axis0_test.h5")
+            verify_sampled_files(
+                f"{data_dir}/300k_150x5_2.h5",
+                [
+                    f"{data_dir}/300k_150x5_2_axis0_all.h5",
+                    f"{data_dir}/300k_150x5_2_axis0_test.h5",
+                ],
+            )
+            logger.info("Verified sampled HDF5 slices for training and test splits")
 
         elif dataset_name == "purchase100":
             if not os.path.exists(f"{data_dir}/dataset_purchase"):
