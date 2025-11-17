@@ -44,43 +44,65 @@ def _sanitize_chunks(chunks, target_shape):
     return tuple(sanitized)
 
 
-def _write_rows(dst_dataset, dest_slice, rows_slice):
-    if len(dest_slice) == 0:
-        return
+def _axis_slice(ndim, axis, start, end):
+    slices = [slice(None)] * ndim
+    slices[axis] = slice(int(start), int(end))
+    return tuple(slices)
+
+
+def _write_along_axis(dst_dataset, dest_slice, data_slice, axis):
     dest_slice = np.asarray(dest_slice, dtype=np.int64)
-    if len(dest_slice) == 1:
-        dst_dataset[int(dest_slice[0])] = rows_slice[0]
+    if dest_slice.size == 0:
         return
-    if np.all(dest_slice[1:] == dest_slice[:-1] + 1):
+
+    if dest_slice.size == 1 or (
+        dest_slice.size > 1 and np.all(dest_slice[1:] == dest_slice[:-1] + 1)
+    ):
         start = int(dest_slice[0])
         end = int(dest_slice[-1]) + 1
-        dst_dataset[start:end] = rows_slice
+        dst_dataset[_axis_slice(dst_dataset.ndim, axis, start, end)] = data_slice[
+            _axis_slice(data_slice.ndim, axis, 0, dest_slice.size)
+        ]
         return
+
     scatter_order = np.argsort(dest_slice, kind="mergesort")
     dest_sorted = dest_slice[scatter_order]
-    rows_sorted = rows_slice[scatter_order]
-    dst_dataset[dest_sorted] = rows_sorted
+    data_sorted = np.take(data_slice, scatter_order, axis=axis)
+
+    start = 0
+    total = len(dest_sorted)
+    while start < total:
+        end = start + 1
+        while end < total and dest_sorted[end] == dest_sorted[end - 1] + 1:
+            end += 1
+        dst_dataset[_axis_slice(dst_dataset.ndim, axis, dest_sorted[start], dest_sorted[end - 1] + 1)] = data_sorted[
+            _axis_slice(data_sorted.ndim, axis, start, end)
+        ]
+        start = end
 
 
-def _stream_copy_rows(src_dataset, dst_dataset, sorted_indices, dest_order):
+def _stream_copy_along_axis(src_dataset, dst_dataset, sorted_indices, dest_order, axis):
     if len(sorted_indices) == 0:
         return
 
-    num_rows = src_dataset.shape[0]
+    axis_len = src_dataset.shape[axis]
     chunk_hint = getattr(src_dataset, "chunks", None)
-    if chunk_hint and len(chunk_hint) > 0 and chunk_hint[0]:
-        chunk_len = int(chunk_hint[0])
-    else:
-        chunk_len = max(1, min(1 << 15, num_rows))
-    chunk_len = max(1, min(chunk_len, num_rows))
-    max_span = max(chunk_len, min(num_rows, chunk_len * 8))
+    chunk_len = None
+    if chunk_hint and len(chunk_hint) > axis and chunk_hint[axis]:
+        chunk_len = int(chunk_hint[axis])
+    if not chunk_len:
+        chunk_len = max(1, min(1 << 15, axis_len))
+    chunk_len = max(1, min(chunk_len, axis_len))
+    max_span = max(chunk_len, min(axis_len, chunk_len * 8))
 
     ptr = 0
     total = len(sorted_indices)
+    axis_slice = [slice(None)] * src_dataset.ndim
+
     while ptr < total:
         idx = int(sorted_indices[ptr])
         chunk_start = (idx // chunk_len) * chunk_len
-        chunk_end = min(chunk_start + chunk_len, num_rows)
+        chunk_end = min(chunk_start + chunk_len, axis_len)
 
         chunk_stop = ptr
         while True:
@@ -91,18 +113,121 @@ def _stream_copy_rows(src_dataset, dst_dataset, sorted_indices, dest_order):
                 break
 
             span = sorted_indices[chunk_stop] - chunk_start
-            if span < max_span and chunk_end < num_rows:
-                chunk_end = min(chunk_end + chunk_len, num_rows)
+            if span < max_span and chunk_end < axis_len:
+                chunk_end = min(chunk_end + chunk_len, axis_len)
                 continue
             break
 
-        data_chunk = src_dataset[chunk_start:chunk_end]
+        axis_slice[axis] = slice(chunk_start, chunk_end)
+        data_chunk = src_dataset[tuple(axis_slice)]
         relative_indices = sorted_indices[ptr:chunk_stop] - chunk_start
-        sampled_rows = data_chunk[relative_indices]
+        sampled = np.take(data_chunk, relative_indices, axis=axis)
         dest_slice = dest_order[ptr:chunk_stop]
-        _write_rows(dst_dataset, dest_slice, sampled_rows)
+        _write_along_axis(dst_dataset, dest_slice, sampled, axis)
 
         ptr = chunk_stop
+
+
+def _infer_axis0_chunk_len(dataset):
+    chunk_hint = getattr(dataset, "chunks", None)
+    if chunk_hint and len(chunk_hint) > 0 and chunk_hint[0]:
+        return max(1, min(int(chunk_hint[0]), dataset.shape[0]))
+    row_volume = int(np.prod(dataset.shape[1:])) if dataset.ndim > 1 else 1
+    row_volume = max(1, row_volume)
+    target_bytes = 16 * 1024 * 1024
+    rows_per_chunk = max(1, target_bytes // (row_volume * max(1, dataset.dtype.itemsize)))
+    return max(1, min(dataset.shape[0], rows_per_chunk))
+
+
+def _infer_axis_chunk_len(dataset, axis, target_bytes=8 * 1024 * 1024):
+    chunk_hint = getattr(dataset, "chunks", None)
+    if chunk_hint and len(chunk_hint) > axis and chunk_hint[axis]:
+        return max(1, min(int(chunk_hint[axis]), dataset.shape[axis]))
+
+    other_dims = dataset.shape[:axis] + dataset.shape[axis + 1 :]
+    elements_per_step = int(np.prod(other_dims)) if other_dims else 1
+    elements_per_step = max(1, elements_per_step)
+    bytes_per_step = elements_per_step * max(1, dataset.dtype.itemsize)
+    steps = max(1, target_bytes // bytes_per_step)
+    return max(1, min(dataset.shape[axis], steps))
+
+
+def _stream_copy_axis1_rowwise(src_dataset, dst_dataset, sorted_indices, sort_order):
+    if len(sorted_indices) == 0:
+        return
+
+    num_rows = src_dataset.shape[0]
+    row_chunk = _infer_axis0_chunk_len(src_dataset)
+    axis_chunk = _infer_axis_chunk_len(src_dataset, axis=1)
+    axis_len = src_dataset.shape[1]
+    max_span = max(axis_chunk, min(axis_len, axis_chunk * 8))
+    needs_reorder = not np.array_equal(sort_order, np.arange(len(sort_order)))
+    total = len(sorted_indices)
+
+    for row_start in range(0, num_rows, row_chunk):
+        row_end = min(num_rows, row_start + row_chunk)
+        row_slice = slice(row_start, row_end)
+        ptr = 0
+        while ptr < total:
+            idx = int(sorted_indices[ptr])
+            chunk_start = (idx // axis_chunk) * axis_chunk
+            chunk_end = min(chunk_start + axis_chunk, axis_len)
+
+            block_stop = ptr
+            while True:
+                while (
+                    block_stop < total
+                    and sorted_indices[block_stop] < chunk_end
+                ):
+                    block_stop += 1
+
+                if block_stop == total:
+                    break
+
+                span = sorted_indices[block_stop] - chunk_start
+                if span < max_span and chunk_end < axis_len:
+                    chunk_end = min(chunk_end + axis_chunk, axis_len)
+                    continue
+                break
+
+            src_sel = [slice(None)] * src_dataset.ndim
+            src_sel[0] = row_slice
+            src_sel[1] = slice(chunk_start, chunk_end)
+            data_chunk = src_dataset[tuple(src_sel)]
+
+            relative = sorted_indices[ptr:block_stop] - chunk_start
+            sampled = np.take(data_chunk, relative, axis=1)
+
+            dest_positions = sort_order[ptr:block_stop]
+            if needs_reorder:
+                perm = np.argsort(dest_positions, kind="mergesort")
+                dest_positions = dest_positions[perm]
+                sampled = np.take(sampled, perm, axis=1)
+
+            write_ptr = 0
+            while write_ptr < len(dest_positions):
+                group_end = write_ptr + 1
+                while (
+                    group_end < len(dest_positions)
+                    and dest_positions[group_end]
+                    == dest_positions[group_end - 1] + 1
+                ):
+                    group_end += 1
+
+                dst_sel = [slice(None)] * dst_dataset.ndim
+                dst_sel[0] = row_slice
+                dst_sel[1] = slice(
+                    int(dest_positions[write_ptr]),
+                    int(dest_positions[group_end - 1]) + 1,
+                )
+
+                data_sel = [slice(None)] * sampled.ndim
+                data_sel[1] = slice(write_ptr, group_end)
+
+                dst_dataset[tuple(dst_sel)] = sampled[tuple(data_sel)]
+                write_ptr = group_end
+
+            ptr = block_stop
 
 
 def save_sampled(src_path, dst_path, indices):
@@ -143,7 +268,63 @@ def save_sampled(src_path, dst_path, indices):
                     dtype=data.dtype,
                     **creation_kwargs,
                 )
-                _stream_copy_rows(data, dst_dataset, sorted_indices, sort_order)
+                _stream_copy_along_axis(data, dst_dataset, sorted_indices, sort_order, axis=0)
+            else:
+                fout.create_dataset(key, data=data[()])
+
+        fout.create_dataset("sampled_indices", data=indices)
+
+
+def save_sampled_axis1(src_path, dst_path, indices):
+    """
+    Sample HDF5 datasets along axis 1 (columns) using the same streaming approach as save_sampled.
+    """
+    indices = np.asarray(indices)
+    if indices.ndim != 1:
+        raise ValueError("indices must be a 1-D sequence")
+    if not np.issubdtype(indices.dtype, np.integer):
+        raise TypeError("indices must be integers")
+    indices = indices.astype(np.int64, copy=False)
+
+    sort_order = np.argsort(indices, kind="mergesort")
+    sorted_indices = indices[sort_order]
+
+    with h5py.File(src_path, "r") as fin, h5py.File(dst_path, "w") as fout:
+        if "X" not in fin:
+            raise KeyError("Source file must contain dataset 'X' to infer sample size")
+        if fin["X"].ndim < 2:
+            raise ValueError("Dataset 'X' must have at least two dimensions for axis-1 sampling")
+        axis_len = fin["X"].shape[1]
+
+        if np.any(indices < 0) or np.any(indices >= axis_len):
+            raise IndexError("indices contain values outside the dataset axis-1 range")
+
+        for key, data in fin.items():
+            if (
+                data.shape
+                and data.ndim > 1
+                and data.shape[1] == axis_len
+            ):
+                target_shape = data.shape[:1] + (len(indices),) + data.shape[2:]
+                creation_kwargs = _copy_sampling_metadata(data)
+                chunks = creation_kwargs.get("chunks")
+                if chunks:
+                    sanitized = _sanitize_chunks(chunks, target_shape)
+                    if sanitized:
+                        creation_kwargs["chunks"] = sanitized
+                    else:
+                        creation_kwargs.pop("chunks", None)
+                if target_shape[1] == 0:
+                    creation_kwargs.pop("chunks", None)
+                dst_dataset = fout.create_dataset(
+                    key,
+                    shape=target_shape,
+                    dtype=data.dtype,
+                    **creation_kwargs,
+                )
+                _stream_copy_axis1_rowwise(
+                    data, dst_dataset, sorted_indices, sort_order
+                )
             else:
                 fout.create_dataset(key, data=data[()])
 
@@ -204,6 +385,75 @@ def verify_sampled_files(src_path, sampled_paths, batch_size=1024):
                             effective_batch,
                             key,
                             sampled_path,
+                            axis=0,
+                        )
+                    else:
+                        src_value = src_dataset[()]
+                        sampled_value = sampled_dataset[()]
+                        if not _arrays_equal(src_value, sampled_value):
+                            raise AssertionError(
+                                f"Dataset '{key}' mismatch between source and {sampled_path}"
+                            )
+
+
+def verify_sampled_files_axis1(src_path, sampled_paths, batch_size=1024):
+    """
+    Validate axis-1 sampled HDF5 files produced by save_sampled_axis1.
+    """
+    if isinstance(sampled_paths, (str, bytes, os.PathLike)):
+        sampled_paths = [sampled_paths]
+
+    with h5py.File(src_path, "r") as src_file:
+        if "X" not in src_file:
+            raise KeyError("Source file must contain dataset 'X' to infer column count.")
+        if src_file["X"].ndim < 2:
+            raise ValueError("Dataset 'X' must have at least two dimensions for axis-1 verification.")
+        axis_len = src_file["X"].shape[1]
+
+        for sampled_path in sampled_paths:
+            with h5py.File(sampled_path, "r") as sampled_file:
+                if "sampled_indices" not in sampled_file:
+                    raise KeyError(
+                        f"'sampled_indices' missing from sampled file {sampled_path}"
+                    )
+                indices = np.asarray(
+                    sampled_file["sampled_indices"][()], dtype=np.int64
+                )
+                if indices.ndim != 1:
+                    raise ValueError(
+                        f"'sampled_indices' must be 1-D in sampled file {sampled_path}"
+                    )
+                if np.any(indices < 0) or np.any(indices >= axis_len):
+                    raise ValueError(
+                        f"Indices in {sampled_path} fall outside the source dataset axis-1 range."
+                    )
+
+                effective_batch = max(1, min(int(batch_size), len(indices)))
+
+                for key, sampled_dataset in sampled_file.items():
+                    if key == "sampled_indices":
+                        continue
+                    if key not in src_file:
+                        raise KeyError(
+                            f"Key '{key}' exists in {sampled_path} but not in source file."
+                        )
+                    src_dataset = src_file[key]
+                    if (
+                        src_dataset.shape
+                        and src_dataset.ndim > 1
+                        and src_dataset.shape[1] == axis_len
+                        and sampled_dataset.shape
+                        and sampled_dataset.ndim > 1
+                        and sampled_dataset.shape[1] == len(indices)
+                    ):
+                        _assert_axis_samples_match(
+                            src_dataset,
+                            sampled_dataset,
+                            indices,
+                            effective_batch,
+                            key,
+                            sampled_path,
+                            axis=1,
                         )
                     else:
                         src_value = src_dataset[()]
@@ -226,31 +476,40 @@ def _arrays_equal(lhs, rhs):
 
 
 def _assert_axis_samples_match(
-    src_dataset, sampled_dataset, indices, batch_size, key, sampled_path
+    src_dataset, sampled_dataset, indices, batch_size, key, sampled_path, axis
 ):
     total = len(indices)
     for start in range(0, total, batch_size):
         end = min(total, start + batch_size)
         batch_indices = indices[start:end]
-        src_slice = _fetch_rows(src_dataset, batch_indices)
-        sampled_slice = sampled_dataset[start:end]
+        src_slice = _fetch_along_axis(src_dataset, batch_indices, axis)
+        sampled_slice = _fetch_along_axis(
+            sampled_dataset, np.arange(start, end, dtype=np.int64), axis
+        )
         if not _arrays_equal(src_slice, sampled_slice):
             raise AssertionError(
                 f"Dataset '{key}' mismatch in rows {start}:{end} for {sampled_path}"
             )
 
 
-def _fetch_rows(dataset, index_batch):
+def _fetch_along_axis(dataset, index_batch, axis):
     if len(index_batch) == 0:
-        return dataset[0:0]
+        empty_slice = [slice(None)] * dataset.ndim
+        empty_slice[axis] = slice(0, 0)
+        return dataset[tuple(empty_slice)]
     index_batch = np.asarray(index_batch, dtype=np.int64)
-    if np.all(index_batch[1:] >= index_batch[:-1]):
-        return dataset[index_batch]
+    selectors = [slice(None)] * dataset.ndim
+    monotonic = np.all(index_batch[1:] >= index_batch[:-1])
+    if monotonic:
+        selectors[axis] = index_batch
+        return dataset[tuple(selectors)]
     sorted_order = np.argsort(index_batch, kind="mergesort")
-    sorted_rows = dataset[index_batch[sorted_order]]
+    sorted_indices = index_batch[sorted_order]
+    selectors[axis] = sorted_indices
+    sorted_data = dataset[tuple(selectors)]
     inverse_order = np.empty_like(sorted_order)
     inverse_order[sorted_order] = np.arange(len(sorted_order))
-    return sorted_rows[inverse_order]
+    return np.take(sorted_data, inverse_order, axis=axis)
 
 
 class InfinitelyIndexableDataset(Dataset):
@@ -404,7 +663,7 @@ def get_dataset(dataset_name: str, data_dir: str, logger: Any, **kwargs: Any) ->
                 single_eval_pos_all = f["single_eval_pos"]
                 num_of_datasets = X_all.shape[0]
                 training_size = int(
-                    len(y_all) * 0.75
+                    num_of_datasets * 0.75
                 ) 
                 idxs = sorted(np.random.choice(num_of_datasets, size=training_size, replace=False))
                 idxs_test = sorted(np.setdiff1d(np.arange(num_of_datasets), idxs))
@@ -442,6 +701,55 @@ def get_dataset(dataset_name: str, data_dir: str, logger: Any, **kwargs: Any) ->
                 ],
             )
             logger.info("Verified sampled HDF5 slices for training and test splits")
+
+            with h5py.File(f"{data_dir}/300k_150x5_2.h5", "r") as f:
+                X_all = f["X"]
+                y_all = f["y"]
+                num_of_samples = X_all.shape[1]
+                single_eval_pos_all = np.array(f["single_eval_pos"])
+                single_eval_pos_all = np.repeat(
+                    np.expand_dims(single_eval_pos_all, axis=1), num_of_samples, axis=1
+                )
+                training_size = int(
+                    num_of_samples * 0.75
+                ) 
+                idxs = sorted(np.random.choice(num_of_samples, size=training_size, replace=False))
+                idxs_test = sorted(np.setdiff1d(np.arange(num_of_samples), idxs))
+                all_data = []
+                for i in idxs:
+                    X_i = np.array(X_all[:, i], dtype=np.float32)
+                    y_i = np.array(y_all[:, i])
+                    y_i = y_i.astype(np.int64, copy=False)
+                    single_eval_pos_i = np.array(single_eval_pos_all[:, i], dtype=np.int8)
+                    all_data.append(TabularDatasetTabPFN(X_i, y_i, single_eval_pos_i))
+                test_data = []
+                for i in idxs_test:
+                    X_i = np.array(X_all[:, i], dtype=np.float32)
+                    y_i = np.array(y_all[:, i])
+                    y_i = y_i.astype(np.int64, copy=False)
+                    single_eval_pos_i = np.array(single_eval_pos_all[:, i], dtype=np.int8)
+                    test_data.append(TabularDatasetTabPFN(X_i, y_i, single_eval_pos_i))
+            save_sampled_axis1(
+                f"{data_dir}/300k_150x5_2.h5",
+                f"{data_dir}/300k_150x5_2_axis1_all.h5",
+                idxs,
+            )
+            logger.info("Save data to 300k_150x5_2_axis1_all.h5")
+            save_sampled_axis1(
+                f"{data_dir}/300k_150x5_2.h5",
+                f"{data_dir}/300k_150x5_2_axis1_test.h5",
+                idxs_test,
+            )
+            logger.info("Save population data to 300k_150x5_2_axis1_test.h5")
+            verify_sampled_files_axis1(
+                f"{data_dir}/300k_150x5_2.h5",
+                [
+                    f"{data_dir}/300k_150x5_2_axis1_all.h5",
+                    f"{data_dir}/300k_150x5_2_axis1_test.h5",
+                ],
+            )
+            logger.info("Verified sampled HDF5 slices for training and test splits")
+            1/0
 
         elif dataset_name == "purchase100":
             if not os.path.exists(f"{data_dir}/dataset_purchase"):
