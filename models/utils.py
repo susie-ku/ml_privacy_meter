@@ -14,7 +14,7 @@ import torchvision
 from transformers import AutoModelForCausalLM
 
 from dataset.utils import get_dataloader
-from models import AlexNet, CNN, MLP, WideResNet
+from models import AlexNet, CNN, MLP, WideResNet, FTTransformer
 from trainers.default_trainer import train, inference, dp_train
 from trainers.fast_train import (
     load_cifar10_data,
@@ -70,6 +70,8 @@ def get_model(model_type: str, dataset_name: str, configs: dict):
         return WideResNet(nin=in_shape, nclass=num_classes, depth=28, width=10)
     elif model_type == "mlp":  # for purchase dataset
         return MLP(in_shape=in_shape, num_classes=num_classes)
+    elif model_type == "fttransformer":  # for purchase dataset
+        return FTTransformer(in_shape=in_shape, num_classes=num_classes)
     elif model_type == "vgg16":
         return torchvision.models.vgg16(pretrained=False)
     else:

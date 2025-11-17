@@ -15,4 +15,6 @@ class MLP(nn.Module):
         inputs = inputs.flatten(1)
         inputs = torch.tanh(self.fc1(inputs))
         outputs = self.fc2(inputs)
+        # print(outputs.shape)
+        # 1/0
         return outputs

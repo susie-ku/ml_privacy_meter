@@ -17,12 +17,12 @@ audit: # Configurations for auditing
 train: # Configuration for training
   model_name: fttransformer # String for indicating the model type. We support CNN, wrn28-1, wrn28-2, wrn28-10, vgg16, mlp and speedyresnet (requires cuda). More model types can be added in model.py.
   device: cuda:0 # String for indicating the device we want to use for training models.
-  batch_size: 256
+  batch_size: 16 # 256
   optimizer: SGD
   learning_rate: 0.1
   weight_decay: 0
   epochs: 100
 
 data: # Configuration for data
-  dataset: purchase100 # String indicates the name of the dataset. We support cifar10, cifar100, purchase100 and texas100 by default.
+  dataset: texas100 # String indicates the name of the dataset. We support cifar10, cifar100, purchase100 and texas100 by default.
   data_dir: data
